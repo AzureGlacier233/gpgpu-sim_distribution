@@ -53,7 +53,9 @@
 class dram_req_t {
  public:
   dram_req_t(class mem_fetch *data, unsigned banks,
-             unsigned dram_bnk_indexing_policy, class gpgpu_sim *gpu);
+             unsigned dram_bnk_indexing_policy, class gpgpu_sim *gpu,
+             const class memory_config *config,
+             const class m3d_mapping_policy *mapping_policy);
 
   unsigned int row;
   unsigned int col;
@@ -66,6 +68,8 @@ class dram_req_t {
   unsigned char rw;  // is the request a read or a write?
   unsigned long long int addr;
   unsigned int insertion_time;
+  unsigned int tier_tag;
+  unsigned int policy_id;
   class mem_fetch *data;
   class gpgpu_sim *m_gpu;
 };
@@ -108,6 +112,7 @@ enum bank_grp_bits_position { HIGHER_BITS = 0, LOWER_BITS };
 
 class mem_fetch;
 class memory_config;
+class m3d_mapping_policy;
 
 class dram_t {
  public:
@@ -231,6 +236,10 @@ class dram_t {
   unsigned int ave_mrqs;
 
   class frfcfs_scheduler *m_frfcfs_scheduler;
+  class m3d_mapping_policy *m_mapping_policy;
+  unsigned long long m_policy_use[4];
+  unsigned long long m_policy_row_hits[4];
+  unsigned long long m_policy_bank_conflicts[4];
 
   unsigned int n_cmd_partial;
   unsigned int n_activity_partial;

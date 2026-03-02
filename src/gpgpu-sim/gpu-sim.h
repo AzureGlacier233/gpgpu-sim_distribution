@@ -110,7 +110,11 @@ __attribute__((weak)) void send_write_request_SST(unsigned core_id,
                                                   uint64_t address, size_t size,
                                                   void *mem_req) {}
 
-enum dram_ctrl_t { DRAM_FIFO = 0, DRAM_FRFCFS = 1 };
+enum dram_ctrl_t {
+  DRAM_FIFO = 0,
+  DRAM_FRFCFS = 1,
+  DRAM_M3D_AWARE_FRFCFS = 2
+};
 
 enum hw_perf_t {
   HW_BENCH_NAME = 0,
@@ -216,6 +220,12 @@ class memory_config {
     m_valid = false;
     gpgpu_dram_timing_opt = NULL;
     gpgpu_L2_queue_config = NULL;
+    gpgpu_m3d_mc_map_enable = false;
+    gpgpu_m3d_mc_map_mode = 0;
+    gpgpu_m3d_mc_policy_table_file = NULL;
+    gpgpu_m3d_sched_weight_rowhit = 8.0;
+    gpgpu_m3d_sched_weight_bank_balance = 1.0;
+    gpgpu_m3d_sched_weight_age = 0.01;
     gpgpu_ctx = ctx;
   }
   void init() {
@@ -308,6 +318,14 @@ class memory_config {
     m_L2_config.init(&m_address_mapping);
 
     m_valid = true;
+    fprintf(stdout,
+            "GPGPU-Sim M3D MC config: map_enable=%u map_mode=%u scheduler=%u "
+            "w_rowhit=%.4f w_balance=%.4f w_age=%.4f table='%s'\n",
+            (unsigned)gpgpu_m3d_mc_map_enable, gpgpu_m3d_mc_map_mode,
+            (unsigned)scheduler_type, gpgpu_m3d_sched_weight_rowhit,
+            gpgpu_m3d_sched_weight_bank_balance, gpgpu_m3d_sched_weight_age,
+            gpgpu_m3d_mc_policy_table_file ? gpgpu_m3d_mc_policy_table_file
+                                           : "");
 
     sscanf(write_queue_size_opt, "%d:%d:%d",
            &gpgpu_frfcfs_dram_write_queue_size, &write_high_watermark,
@@ -334,6 +352,12 @@ class memory_config {
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
   bool gpgpu_memlatency_stat;
+  bool gpgpu_m3d_mc_map_enable;
+  unsigned gpgpu_m3d_mc_map_mode;
+  char *gpgpu_m3d_mc_policy_table_file;
+  double gpgpu_m3d_sched_weight_rowhit;
+  double gpgpu_m3d_sched_weight_bank_balance;
+  double gpgpu_m3d_sched_weight_age;
   unsigned m_n_mem;
   unsigned m_n_sub_partition_per_memory_channel;
   unsigned m_n_mem_sub_partition;

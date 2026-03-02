@@ -45,6 +45,7 @@
 #include "gpu-misc.h"
 #include "gpu-sim.h"
 #include "icnt_wrapper.h"
+#include "l15_scratchpad.h"
 #include "mem_fetch.h"
 #include "mem_latency_stat.h"
 #include "shader_trace.h"
@@ -633,6 +634,20 @@ void shader_core_stats::print(FILE *fout) const {
   fprintf(fout, "gpgpu_n_mem_write_global = %d\n", gpgpu_n_mem_write_global);
   fprintf(fout, "gpgpu_n_mem_texture = %d\n", gpgpu_n_mem_texture);
   fprintf(fout, "gpgpu_n_mem_const = %d\n", gpgpu_n_mem_const);
+  fprintf(fout, "gpgpu_n_l15_access = %llu\n", gpgpu_n_l15_access);
+  fprintf(fout, "gpgpu_n_l15_hit = %llu\n", gpgpu_n_l15_hit);
+  fprintf(fout, "gpgpu_n_l15_miss = %llu\n", gpgpu_n_l15_miss);
+  fprintf(fout, "gpgpu_n_l15_reservation_fail = %llu\n",
+          gpgpu_n_l15_reservation_fail);
+  fprintf(fout, "gpgpu_n_l15_bank_conflict = %llu\n",
+          gpgpu_n_l15_bank_conflict);
+  fprintf(fout, "gpgpu_n_l15_hit_latency_cycles = %llu\n",
+          gpgpu_n_l15_hit_latency_cycles);
+  double l15_hit_rate = 0.0;
+  if (gpgpu_n_l15_access) {
+    l15_hit_rate = (double)gpgpu_n_l15_hit / (double)gpgpu_n_l15_access;
+  }
+  fprintf(fout, "gpgpu_l15_hit_rate = %.6f\n", l15_hit_rate);
 
   fprintf(fout, "gpgpu_n_load_insn  = %d\n", gpgpu_n_load_insn);
   fprintf(fout, "gpgpu_n_store_insn = %d\n", gpgpu_n_store_insn);
@@ -2213,6 +2228,33 @@ void ldst_unit::L1_latency_queue_cycle() {
   }
 }
 
+void ldst_unit::L15_hit_queue_cycle(unsigned long long cycle) {
+  while (!m_l15_hit_queue.empty() && m_l15_hit_queue.front().ready_cycle <= cycle) {
+    l15_hit_event evt = m_l15_hit_queue.front();
+    m_l15_hit_queue.pop_front();
+
+    for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
+      unsigned reg_id = evt.out_regs[r];
+      if (reg_id == 0) continue;
+      assert(m_pending_writes[evt.warp_id][reg_id] > 0);
+      unsigned still_pending = --m_pending_writes[evt.warp_id][reg_id];
+      if (!still_pending) {
+        m_pending_writes[evt.warp_id].erase(reg_id);
+        m_scoreboard->releaseRegister(evt.warp_id, reg_id);
+        m_core->warp_inst_complete(evt.inst);
+      }
+    }
+
+    if (evt.is_ldgsts) {
+      unsigned &pending = m_pending_ldgsts[evt.warp_id][evt.pc][evt.addr];
+      if (pending > 0) pending--;
+      if (pending == 0) {
+        m_core->unset_depbar(evt.inst);
+      }
+    }
+  }
+}
+
 bool ldst_unit::constant_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
                                mem_stage_access_type &fail_type) {
   if (inst.empty() || ((inst.space.get_type() != const_space) &&
@@ -2269,7 +2311,53 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
   if (inst.accessq_empty()) return true;
 
   mem_stage_stall_type stall_cond = NO_RC_FAIL;
-  const mem_access_t &access = inst.accessq_back();
+  unsigned long long now =
+      m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
+
+  l15_scratchpad *l15 = NULL;
+  if (m_core->get_cluster()) {
+    l15 = m_core->get_cluster()->get_l15();
+  }
+
+  if (inst.is_load() && m_config->gpgpu_l15_enable && l15) {
+    unsigned probe_budget = m_config->m_L1D_config.l1_banks;
+    if (probe_budget == 0) probe_budget = 1;
+
+    for (unsigned i = 0; i < probe_budget; ++i) {
+      if (inst.accessq_empty()) break;
+      const mem_access_t &l15_access = inst.accessq_back();
+      enum cache_request_status l15_status =
+          l15->access(l15_access.get_addr(), false, now);
+      m_stats->gpgpu_n_l15_access++;
+
+      if (l15_status == HIT) {
+        m_stats->gpgpu_n_l15_hit++;
+        m_stats->gpgpu_n_l15_hit_latency_cycles += m_config->gpgpu_l15_latency;
+        l15_hit_event evt;
+        evt.ready_cycle = now + m_config->gpgpu_l15_latency;
+        evt.warp_id = inst.warp_id();
+        evt.is_ldgsts = inst.m_is_ldgsts;
+        evt.pc = inst.pc;
+        evt.addr = l15_access.get_addr();
+        evt.inst = inst;
+        for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
+          evt.out_regs[r] = inst.out[r];
+        }
+        m_l15_hit_queue.push_back(evt);
+        inst.accessq_pop_back();
+      } else if (l15_status == MISS) {
+        m_stats->gpgpu_n_l15_miss++;
+        break;
+      } else {
+        m_stats->gpgpu_n_l15_reservation_fail++;
+        m_stats->gpgpu_n_l15_bank_conflict++;
+        stall_cond = BK_CONF;
+        break;
+      }
+    }
+  }
+
+  if (inst.accessq_empty()) return true;
 
   bool bypassL1D = false;
   if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
@@ -2279,7 +2367,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
     if (m_core->get_config()->gmem_skip_L1D && (CACHE_L1 != inst.cache_op))
       bypassL1D = true;
   }
-  if (bypassL1D) {
+  if (stall_cond == NO_RC_FAIL && bypassL1D) {
     // bypass L1 cache
     unsigned control_size =
         inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
@@ -2305,8 +2393,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
       } else {
         mem_fetch *mf =
             m_mf_allocator->alloc(inst, access,
-                                  m_core->get_gpu()->gpu_sim_cycle +
-                                      m_core->get_gpu()->gpu_tot_sim_cycle);
+                                  now);
         m_icnt->push(mf);
         inst.accessq_pop_back();
         // inst.clear_active( access.get_warp_mask() );
@@ -2318,7 +2405,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
           m_core->inc_store_req(inst.warp_id());
       }
     }
-  } else {
+  } else if (stall_cond == NO_RC_FAIL) {
     assert(CACHE_UNDEFINED != inst.cache_op);
     stall_cond = process_memory_access_queue_l1cache(m_L1D, inst);
   }
@@ -2843,6 +2930,9 @@ inst->space.get_type() != shared_space) { unsigned warp_id = inst->warp_id();
 void ldst_unit::cycle() {
   writeback();
 
+  L15_hit_queue_cycle(m_core->get_gpu()->gpu_sim_cycle +
+                      m_core->get_gpu()->gpu_tot_sim_cycle);
+
   for (unsigned stage = 0; (stage + 1) < m_pipeline_depth; stage++)
     if (m_pipeline_reg[stage]->empty() && !m_pipeline_reg[stage + 1]->empty())
       move_warp(m_pipeline_reg[stage], m_pipeline_reg[stage + 1]);
@@ -2877,6 +2967,14 @@ void ldst_unit::cycle() {
         assert(!mf->get_is_write());  // L1 cache is write evict, allocate line
                                       // on load miss only
 
+        l15_scratchpad *l15 = NULL;
+        if (m_core->get_cluster()) l15 = m_core->get_cluster()->get_l15();
+        bool do_l15_fill =
+            (l15 && m_config->gpgpu_l15_enable &&
+             m_config->gpgpu_l15_fill_policy == 1 &&
+             (mf->get_access_type() == GLOBAL_ACC_R ||
+              mf->get_access_type() == LOCAL_ACC_R));
+
         bool bypassL1D = false;
         if (CACHE_GLOBAL == mf->get_inst().cache_op || (m_L1D == NULL)) {
           bypassL1D = true;
@@ -2890,11 +2988,17 @@ void ldst_unit::cycle() {
             mf->set_status(IN_SHADER_FETCHED,
                            m_core->get_gpu()->gpu_sim_cycle +
                                m_core->get_gpu()->gpu_tot_sim_cycle);
+            if (do_l15_fill)
+              l15->fill(mf->get_addr(), m_core->get_gpu()->gpu_sim_cycle +
+                                           m_core->get_gpu()->gpu_tot_sim_cycle);
             m_response_fifo.pop_front();
             m_next_global = mf;
           }
         } else {
           if (m_L1D->fill_port_free()) {
+            if (do_l15_fill)
+              l15->fill(mf->get_addr(), m_core->get_gpu()->gpu_sim_cycle +
+                                           m_core->get_gpu()->gpu_tot_sim_cycle);
             m_L1D->fill(mf, m_core->get_gpu()->gpu_sim_cycle +
                                 m_core->get_gpu()->gpu_tot_sim_cycle);
             m_response_fifo.pop_front();
@@ -4481,9 +4585,18 @@ simt_core_cluster::simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id,
   m_stats = stats;
   m_memory_stats = mstats;
   m_mem_config = mem_config;
+  m_l15 = NULL;
+  if (m_config->gpgpu_l15_enable) {
+    m_l15 = new l15_scratchpad(m_config);
+  }
 }
 
+simt_core_cluster::~simt_core_cluster() { delete m_l15; }
+
 void simt_core_cluster::core_cycle() {
+  if (m_l15) {
+    m_l15->cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+  }
   for (std::list<unsigned>::iterator it = m_core_sim_order.begin();
        it != m_core_sim_order.end(); ++it) {
     m_core[*it]->cycle();

@@ -351,6 +351,7 @@ unsigned register_bank(int regnum, int wid, unsigned num_banks,
 class shader_core_ctx;
 class shader_core_config;
 class shader_core_stats;
+class l15_scratchpad;
 
 enum scheduler_prioritization_type {
   SCHEDULER_PRIORITIZATION_LRR = 0,   // Loose Round Robin
@@ -1475,6 +1476,18 @@ class ldst_unit : public pipelined_simd_unit {
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
   void L1_latency_queue_cycle();
+
+  struct l15_hit_event {
+    unsigned long long ready_cycle;
+    unsigned warp_id;
+    bool is_ldgsts;
+    unsigned pc;
+    new_addr_type addr;
+    warp_inst_t inst;
+    unsigned out_regs[MAX_OUTPUT_VALUES];
+  };
+  std::deque<l15_hit_event> m_l15_hit_queue;
+  void L15_hit_queue_cycle(unsigned long long cycle);
 };
 
 enum pipeline_stage_name_t {
@@ -1514,6 +1527,13 @@ class shader_core_config : public core_config {
  public:
   shader_core_config(gpgpu_context *ctx) : core_config(ctx) {
     pipeline_widths_string = NULL;
+    gpgpu_l15_enable = false;
+    gpgpu_l15_size_per_cluster_kb = 0;
+    gpgpu_l15_line_size = 128;
+    gpgpu_l15_latency = 30;
+    gpgpu_l15_banks = 4;
+    gpgpu_l15_fill_policy = 1;
+    gpgpu_l15_policy_mode = 2;
     gpgpu_ctx = ctx;
   }
 
@@ -1568,6 +1588,12 @@ class shader_core_config : public core_config {
     gpgpu_cache_texl1_linesize = m_L1T_config.get_line_sz();
     gpgpu_cache_constl1_linesize = m_L1C_config.get_line_sz();
     m_valid = true;
+    fprintf(stdout,
+            "GPGPU-Sim L1.5 config: enable=%u size_kb=%u line=%u latency=%u "
+            "banks=%u fill_policy=%u policy_mode=%u\n",
+            (unsigned)gpgpu_l15_enable, gpgpu_l15_size_per_cluster_kb,
+            gpgpu_l15_line_size, gpgpu_l15_latency, gpgpu_l15_banks,
+            gpgpu_l15_fill_policy, gpgpu_l15_policy_mode);
 
     m_specialized_unit_num = 0;
     // parse the specialized units
@@ -1638,6 +1664,13 @@ class shader_core_config : public core_config {
   mutable cache_config m_L1T_config;
   mutable cache_config m_L1C_config;
   mutable l1d_cache_config m_L1D_config;
+  bool gpgpu_l15_enable;
+  unsigned gpgpu_l15_size_per_cluster_kb;
+  unsigned gpgpu_l15_line_size;
+  unsigned gpgpu_l15_latency;
+  unsigned gpgpu_l15_banks;
+  unsigned gpgpu_l15_fill_policy;
+  unsigned gpgpu_l15_policy_mode;
 
   bool gpgpu_dwf_reg_bankconflict;
 
@@ -1810,6 +1843,12 @@ struct shader_core_stats_pod {
   int gpgpu_n_mem_l2_writeback;
   int gpgpu_n_mem_l1_write_allocate;
   int gpgpu_n_mem_l2_write_allocate;
+  unsigned long long gpgpu_n_l15_access;
+  unsigned long long gpgpu_n_l15_hit;
+  unsigned long long gpgpu_n_l15_miss;
+  unsigned long long gpgpu_n_l15_reservation_fail;
+  unsigned long long gpgpu_n_l15_bank_conflict;
+  unsigned long long gpgpu_n_l15_hit_latency_cycles;
 
   unsigned made_write_mfs;
   unsigned made_read_mfs;
@@ -2099,6 +2138,7 @@ class shader_core_ctx : public core_t {
   }
   kernel_info_t *get_kernel() { return m_kernel; }
   unsigned get_sid() const { return m_sid; }
+  class simt_core_cluster *get_cluster() const { return m_cluster; }
 
   // used by functional simulation:
   // modifiers
@@ -2616,6 +2656,7 @@ class simt_core_cluster {
                     const shader_core_config *config,
                     const memory_config *mem_config, shader_core_stats *stats,
                     memory_stats_t *mstats);
+  virtual ~simt_core_cluster();
 
   void core_cycle();
   void icnt_cycle();
@@ -2644,6 +2685,7 @@ class simt_core_cluster {
   unsigned get_n_active_cta() const;
   unsigned get_n_active_sms() const;
   gpgpu_sim *get_gpu() { return m_gpu; }
+  l15_scratchpad *get_l15() const { return m_l15; }
 
   void display_pipeline(unsigned sid, FILE *fout, int print_mem, int mask);
   void print_cache_stats(FILE *fp, unsigned &dl1_accesses,
@@ -2672,6 +2714,7 @@ class simt_core_cluster {
   unsigned m_cta_issue_next_core;
   std::list<unsigned> m_core_sim_order;
   std::list<mem_fetch *> m_response_fifo;
+  l15_scratchpad *m_l15;
 };
 
 class exec_simt_core_cluster : public simt_core_cluster {

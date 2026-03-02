@@ -38,6 +38,7 @@
 #include "l2cache.h"
 #include "mem_fetch.h"
 #include "mem_latency_stat.h"
+#include "m3d_mapping_policy.h"
 
 #ifdef DRAM_VERIFY
 int PRINT_CYCLE = 0;
@@ -123,8 +124,15 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
           ? 1024
           : m_config->gpgpu_dram_return_queue_size);
   m_frfcfs_scheduler = NULL;
-  if (m_config->scheduler_type == DRAM_FRFCFS)
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS)
     m_frfcfs_scheduler = new frfcfs_scheduler(m_config, this, stats);
+  m_mapping_policy = new m3d_mapping_policy(m_config);
+  for (unsigned i = 0; i < 4; ++i) {
+    m_policy_use[i] = 0;
+    m_policy_row_hits[i] = 0;
+    m_policy_bank_conflicts[i] = 0;
+  }
   n_cmd = 0;
   n_activity = 0;
   n_nop = 0;
@@ -162,7 +170,8 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
 }
 
 bool dram_t::full(bool is_write) const {
-  if (m_config->scheduler_type == DRAM_FRFCFS) {
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS) {
     if (m_config->gpgpu_frfcfs_dram_sched_queue_size == 0) return false;
     if (m_config->seperate_write_queue_enabled) {
       if (is_write)
@@ -180,7 +189,8 @@ bool dram_t::full(bool is_write) const {
 
 unsigned dram_t::que_length() const {
   unsigned nreqs = 0;
-  if (m_config->scheduler_type == DRAM_FRFCFS) {
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS) {
     nreqs = m_frfcfs_scheduler->num_pending();
   } else {
     nreqs = mrqq->get_length();
@@ -196,13 +206,17 @@ unsigned int dram_t::queue_limit() const {
 
 dram_req_t::dram_req_t(class mem_fetch *mf, unsigned banks,
                        unsigned dram_bnk_indexing_policy,
-                       class gpgpu_sim *gpu) {
+                       class gpgpu_sim *gpu, const class memory_config *config,
+                       const class m3d_mapping_policy *mapping_policy) {
+  (void)config;
   txbytes = 0;
   dqbytes = 0;
   data = mf;
   m_gpu = gpu;
 
   const addrdec_t &tlx = mf->get_tlx_addr();
+  tier_tag = 0;
+  policy_id = 0;
 
   switch (dram_bnk_indexing_policy) {
     case LINEAR_BK_INDEX: {
@@ -236,6 +250,15 @@ dram_req_t::dram_req_t(class mem_fetch *mf, unsigned banks,
 
   row = tlx.row;
   col = tlx.col;
+  if (mapping_policy && mapping_policy->enabled()) {
+    m3d_mapping_result_t mapped =
+        mapping_policy->apply(mf->get_addr(), tlx, banks);
+    bk = mapped.bank;
+    row = mapped.row;
+    col = mapped.col;
+    tier_tag = mapped.tier_tag;
+    policy_id = mapped.policy_id;
+  }
   nbytes = mf->get_data_size();
 
   timestamp = m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
@@ -250,7 +273,11 @@ void dram_t::push(class mem_fetch *data) {
 
   dram_req_t *mrq =
       new dram_req_t(data, m_config->nbk, m_config->dram_bnk_indexing_policy,
-                     m_memory_partition_unit->get_mgpu());
+                     m_memory_partition_unit->get_mgpu(), m_config,
+                     m_mapping_policy);
+  if (mrq->policy_id < 4) {
+    m_policy_use[mrq->policy_id]++;
+  }
 
   data->set_status(IN_PARTITION_MC_INTERFACE_QUEUE,
                    m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
@@ -259,7 +286,8 @@ void dram_t::push(class mem_fetch *data) {
   // stats...
   n_req += 1;
   n_req_partial += 1;
-  if (m_config->scheduler_type == DRAM_FRFCFS) {
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS) {
     unsigned nreqs = m_frfcfs_scheduler->num_pending();
     if (nreqs > max_mrqs_temp) max_mrqs_temp = nreqs;
   } else {
@@ -327,11 +355,15 @@ void dram_t::cycle() {
     case DRAM_FRFCFS:
       scheduler_frfcfs();
       break;
+    case DRAM_M3D_AWARE_FRFCFS:
+      scheduler_frfcfs();
+      break;
     default:
       printf("Error: Unknown DRAM scheduler type\n");
       assert(0);
   }
-  if (m_config->scheduler_type == DRAM_FRFCFS) {
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS) {
     unsigned nreqs = m_frfcfs_scheduler->num_pending();
     if (nreqs > max_mrqs) {
       max_mrqs = nreqs;
@@ -778,9 +810,19 @@ void dram_t::print(FILE *simFile) const {
   fprintf(simFile, "\ndram_eff_bins:");
   for (i = 0; i < 10; i++) fprintf(simFile, " %d", dram_eff_bins[i]);
   fprintf(simFile, "\n");
-  if (m_config->scheduler_type == DRAM_FRFCFS)
+  if (m_config->scheduler_type == DRAM_FRFCFS ||
+      m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS)
     fprintf(simFile, "mrqq: max=%d avg=%g\n", max_mrqs,
             (float)ave_mrqs / n_cmd);
+
+  fprintf(simFile, "m3d_policy_use: %llu %llu %llu %llu\n", m_policy_use[0],
+          m_policy_use[1], m_policy_use[2], m_policy_use[3]);
+  fprintf(simFile, "m3d_policy_row_hits: %llu %llu %llu %llu\n",
+          m_policy_row_hits[0], m_policy_row_hits[1], m_policy_row_hits[2],
+          m_policy_row_hits[3]);
+  fprintf(simFile, "m3d_policy_bank_conflicts: %llu %llu %llu %llu\n",
+          m_policy_bank_conflicts[0], m_policy_bank_conflicts[1],
+          m_policy_bank_conflicts[2], m_policy_bank_conflicts[3]);
 }
 
 void dram_t::visualize() const {

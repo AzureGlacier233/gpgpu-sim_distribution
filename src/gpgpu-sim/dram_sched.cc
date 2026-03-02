@@ -135,6 +135,86 @@ dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
     m_current_last_row = m_last_write_row;
   }
 
+  if (m_config->scheduler_type == DRAM_M3D_AWARE_FRFCFS) {
+    if (m_current_queue[bank].empty()) return NULL;
+
+    std::map<unsigned, unsigned> tier_load;
+    for (std::list<dram_req_t *>::iterator it = m_current_queue[bank].begin();
+         it != m_current_queue[bank].end(); ++it) {
+      tier_load[(*it)->tier_tag]++;
+    }
+
+    std::list<dram_req_t *>::iterator best_it = m_current_queue[bank].begin();
+    double best_score = -1e100;
+    for (std::list<dram_req_t *>::iterator it = m_current_queue[bank].begin();
+         it != m_current_queue[bank].end(); ++it) {
+      dram_req_t *cand = *it;
+      const double row_hit = (cand->row == curr_row) ? 1.0 : 0.0;
+      const double age =
+          (double)(m_dram->m_gpu->gpu_sim_cycle - cand->insertion_time);
+      const double balance = 1.0 / (double)tier_load[cand->tier_tag];
+      double score = m_config->gpgpu_m3d_sched_weight_rowhit * row_hit +
+                     m_config->gpgpu_m3d_sched_weight_bank_balance * balance +
+                     m_config->gpgpu_m3d_sched_weight_age * age;
+      if (score > best_score) {
+        best_score = score;
+        best_it = it;
+      }
+    }
+
+    dram_req_t *req = *best_it;
+    bool rowhit = (req->row == curr_row);
+    if (!rowhit) data_collection(bank);
+
+    if (req->policy_id < 4) {
+      if (rowhit) m_dram->m_policy_row_hits[req->policy_id]++;
+      if (!rowhit && m_current_queue[bank].size() > 1)
+        m_dram->m_policy_bank_conflicts[req->policy_id]++;
+    }
+
+    std::map<unsigned, std::list<std::list<dram_req_t *>::iterator> >::iterator
+        bin_ptr = m_current_bins[bank].find(req->row);
+    if (bin_ptr != m_current_bins[bank].end()) {
+      std::list<std::list<dram_req_t *>::iterator>::iterator row_it =
+          bin_ptr->second.begin();
+      for (; row_it != bin_ptr->second.end(); ++row_it) {
+        if (*row_it == best_it) {
+          bin_ptr->second.erase(row_it);
+          break;
+        }
+      }
+      if (bin_ptr->second.empty()) m_current_bins[bank].erase(bin_ptr);
+    }
+
+    m_current_queue[bank].erase(best_it);
+    m_current_last_row[bank] = NULL;
+
+    m_dram->access_num++;
+    bool is_write = req->data->is_write();
+    if (is_write)
+      m_dram->write_num++;
+    else
+      m_dram->read_num++;
+    if (rowhit) {
+      m_dram->hits_num++;
+      if (is_write)
+        m_dram->hits_write_num++;
+      else
+        m_dram->hits_read_num++;
+    }
+    m_stats->concurrent_row_access[m_dram->id][bank]++;
+    m_stats->row_access[m_dram->id][bank]++;
+
+    if (m_config->seperate_write_queue_enabled && req->data->is_write()) {
+      assert(m_num_write_pending != 0);
+      m_num_write_pending--;
+    } else {
+      assert(m_num_pending != 0);
+      m_num_pending--;
+    }
+    return req;
+  }
+
   if (m_current_last_row[bank] == NULL) {
     if (m_current_queue[bank].empty()) return NULL;
 
@@ -170,6 +250,11 @@ dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
       m_dram->hits_write_num++;
     else
       m_dram->hits_read_num++;
+  }
+  if (req->policy_id < 4) {
+    if (rowhit) m_dram->m_policy_row_hits[req->policy_id]++;
+    if (!rowhit && m_current_queue[bank].size() > 1)
+      m_dram->m_policy_bank_conflicts[req->policy_id]++;
   }
 
   m_stats->concurrent_row_access[m_dram->id][bank]++;

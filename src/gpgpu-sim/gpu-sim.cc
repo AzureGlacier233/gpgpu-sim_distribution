@@ -240,8 +240,33 @@ void memory_config::reg_options(class OptionParser *opp) {
                          &simple_dram_model,
                          "simple_dram_model with fixed latency and BW", "0");
   option_parser_register(opp, "-gpgpu_dram_scheduler", OPT_INT32,
-                         &scheduler_type, "0 = fifo, 1 = FR-FCFS (defaul)",
+                         &scheduler_type,
+                         "0 = fifo, 1 = FR-FCFS, 2 = M3D-aware FR-FCFS",
                          "1");
+  option_parser_register(opp, "-gpgpu_m3d_mc_map_enable", OPT_BOOL,
+                         &gpgpu_m3d_mc_map_enable,
+                         "Enable controller-level M3D mapping policy", "0");
+  option_parser_register(opp, "-gpgpu_m3d_mc_map_mode", OPT_UINT32,
+                         &gpgpu_m3d_mc_map_mode,
+                         "0 = ROW_LOCAL, 1 = BANK_BALANCED, 2 = HYBRID, "
+                         "3 = REGION_TABLE",
+                         "0");
+  option_parser_register(opp, "-gpgpu_m3d_mc_policy_table_file", OPT_CSTR,
+                         &gpgpu_m3d_mc_policy_table_file,
+                         "CSV table mapping address regions to policy IDs",
+                         "");
+  option_parser_register(opp, "-gpgpu_m3d_sched_weight_rowhit", OPT_DOUBLE,
+                         &gpgpu_m3d_sched_weight_rowhit,
+                         "Weight for row-hit preference in M3D-aware scheduler",
+                         "8.0");
+  option_parser_register(opp, "-gpgpu_m3d_sched_weight_bank_balance",
+                         OPT_DOUBLE, &gpgpu_m3d_sched_weight_bank_balance,
+                         "Weight for tier/bank balance in M3D-aware scheduler",
+                         "1.0");
+  option_parser_register(opp, "-gpgpu_m3d_sched_weight_age", OPT_DOUBLE,
+                         &gpgpu_m3d_sched_weight_age,
+                         "Weight for request age in M3D-aware scheduler",
+                         "0.01");
   option_parser_register(opp, "-gpgpu_dram_partition_queues", OPT_CSTR,
                          &gpgpu_L2_queue_config, "i2$:$2d:d2$:$2i", "8:8:8:8");
 
@@ -370,6 +395,27 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "l1 banks hashing function", "0");
   option_parser_register(opp, "-gpgpu_l1_latency", OPT_UINT32,
                          &m_L1D_config.l1_latency, "L1 Hit Latency", "1");
+  option_parser_register(opp, "-gpgpu_l15_enable", OPT_BOOL, &gpgpu_l15_enable,
+                         "Enable cluster-shared L1.5 scratchpad", "0");
+  option_parser_register(
+      opp, "-gpgpu_l15_size_per_cluster_kb", OPT_UINT32,
+      &gpgpu_l15_size_per_cluster_kb, "L1.5 scratchpad size per cluster in KB",
+      "0");
+  option_parser_register(opp, "-gpgpu_l15_line_size", OPT_UINT32,
+                         &gpgpu_l15_line_size, "L1.5 line size in bytes",
+                         "128");
+  option_parser_register(opp, "-gpgpu_l15_latency", OPT_UINT32,
+                         &gpgpu_l15_latency, "L1.5 hit latency in cycles", "30");
+  option_parser_register(opp, "-gpgpu_l15_banks", OPT_UINT32, &gpgpu_l15_banks,
+                         "Number of L1.5 banks per cluster", "4");
+  option_parser_register(opp, "-gpgpu_l15_fill_policy", OPT_UINT32,
+                         &gpgpu_l15_fill_policy,
+                         "L1.5 fill policy (0=none,1=on_miss)", "1");
+  option_parser_register(opp, "-gpgpu_l15_policy_mode", OPT_UINT32,
+                         &gpgpu_l15_policy_mode,
+                         "L1.5 mapping policy (0=row_local,1=bank_balanced,"
+                         "2=hybrid)",
+                         "2");
   option_parser_register(opp, "-gpgpu_smem_latency", OPT_UINT32, &smem_latency,
                          "smem Latency", "3");
   option_parser_register(opp, "-gpgpu_cache:dl1PrefL1", OPT_CSTR,
